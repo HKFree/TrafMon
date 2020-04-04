@@ -1,0 +1,6 @@
+bufferSize: 64
+snapLen: 65535
+ifaces:
+- eth4
+- eth5
+monitorInterval: 5

@@ -9,15 +9,15 @@
 package main
 
 import (
-	"flag"
+	//	"flag"
 	"fmt"
 	"log"
-	"os"
 	"net"
-//	"encoding/binary"
+	"os"
+	//	"encoding/binary"
 	"time"
-//	"runtime/pprof"
-//	"time"
+	//	"runtime/pprof"
+	//	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/afpacket"
@@ -25,18 +25,17 @@ import (
 	"github.com/google/gopacket/pcap"
 	"golang.org/x/net/bpf"
 
+	"github.com/spf13/viper"
+
 	_ "github.com/google/gopacket/layers"
 )
 
 var (
-	iface      = flag.String("i", "any", "Interface to read from")
-	cpuprofile = flag.String("cpuprofile", "", "If non-empty, write CPU profile here")
-	snaplen    = flag.Int("s", 0, "Snaplen, if <= 0, use 65535")
-	bufferSize = flag.Int("b", 8, "Interface buffersize (MB)")
-	filter     = flag.String("f", "port not 22", "BPF filter")
-	count      = flag.Int64("c", -1, "If >= 0, # of packets to capture before returning")
-	verbose    = flag.Int64("log_every", 1, "Write a log every X packets")
-	addVLAN    = flag.Bool("add_vlan", false, "If true, add VLAN header")
+	bufferSize      int
+	snapLen         int
+	verbose         int = 1000000
+	monitorInterval int
+	ifaces          []string
 )
 
 // afpacketComputeSize computes the block_size and the num_blocks in such a way that the
@@ -64,27 +63,26 @@ func afpacketComputeSize(targetSizeMb int, snaplen int, pageSize int) (
 }
 
 type flow struct {
-	addr		net.IP
-	bytesUp		uint16
-	bytesDown	uint16
+	addr      net.IP
+	bytesUp   uint16
+	bytesDown uint16
 }
 
 func runSocket(szFrame int, szBlock int, numBlocks int, iface string, bpf []bpf.RawInstruction, traffic chan flow, done chan bool) {
 	afpacket, err := afpacket.NewTPacket(
-			afpacket.OptInterface(iface),
-                        afpacket.OptFrameSize(szFrame),
-                        afpacket.OptBlockSize(szBlock),
-                        afpacket.OptNumBlocks(numBlocks),
-                        afpacket.OptAddVLANHeader(false),
-                        afpacket.OptPollTimeout(pcap.BlockForever),
-                        afpacket.SocketRaw,
-                        afpacket.TPacketVersion3)
+		afpacket.OptInterface(iface),
+		afpacket.OptFrameSize(szFrame),
+		afpacket.OptBlockSize(szBlock),
+		afpacket.OptNumBlocks(numBlocks),
+		afpacket.OptAddVLANHeader(false),
+		afpacket.OptPollTimeout(pcap.BlockForever),
+		afpacket.SocketRaw,
+		afpacket.TPacketVersion3)
 
 	if err != nil {
 		log.Fatal(err)
 	}
 
-//	source := gopacket.ZeroCopyPacketDataSource(afpacket)
 	defer afpacket.Close()
 
 	err = afpacket.SetBPF(bpf)
@@ -95,17 +93,31 @@ func runSocket(szFrame int, szBlock int, numBlocks int, iface string, bpf []bpf.
 	myNetsString := [2]string{"10.107.0.0/16", "89.248.240.0/20"}
 
 	var myNets [2]net.IPNet
-	for id, myNetString := range myNetsString{
+	for id, myNetString := range myNetsString {
 		_, mn, _ := net.ParseCIDR(myNetString)
 		myNets[id] = *mn
 	}
 
+	// This is needed to skip first ~second of receive, because BPF rules application takes some time...
+	initialTimer := time.NewTimer(time.Second)
+	skip := true
+
 	bytes := uint64(0)
 	packets := uint64(0)
-	for ; *count != 0; *count-- {
+	for {
 		data, _, err := afpacket.ZeroCopyReadPacketData()
 		if err != nil {
 			log.Fatal(err)
+		}
+
+		// skip until one second passes
+		if skip == true {
+			select {
+			case <-initialTimer.C:
+				skip = false
+			default:
+			}
+			continue
 		}
 
 		ethernet := layers.Ethernet{}
@@ -114,71 +126,102 @@ func runSocket(szFrame int, szBlock int, numBlocks int, iface string, bpf []bpf.
 		err = ethernet.DecodeFromBytes(data, gopacket.NilDecodeFeedback)
 
 		if err != nil {
-			log.Fatalf("Failed to deserialize ethernet layer: %v", err)
+			log.Printf("Failed to deserialize ethernet layer: %v", err)
+			continue
 		}
 
 		err = ip.DecodeFromBytes(ethernet.Payload, gopacket.NilDecodeFeedback)
 
 		if err != nil {
-			log.Fatal("Failed to deserialize ip layer: %v", err)
+			log.Printf("Failed to deserialize ip layer: %v", err)
+			continue
 		}
 
 		// Upload
 		for _, myNet := range myNets {
 			if myNet.Contains(ip.SrcIP) {
-				traffic<-flow{ip.SrcIP, uint16(len(data)), 0}
+				traffic <- flow{ip.SrcIP, uint16(len(data)), 0}
 			}
 		}
 
 		// Donwload
 		for _, myNet := range myNets {
 			if myNet.Contains(ip.DstIP) {
-				traffic<-flow{ip.DstIP, 0, uint16(len(data))}
+				traffic <- flow{ip.DstIP, 0, uint16(len(data))}
 			}
 		}
 
-
-		bytes += uint64(len(data))
-		packets++
-		if *count%*verbose == 0 {
+		//bytes += uint64(len(data))
+		//packets++
+		/*	if *count%*verbose == 0 {
 			_, afpacketStats, err := afpacket.SocketStats()
 			if err != nil {
 				log.Println(err)
 			}
 			log.Printf("%s Read in %d bytes in %d packets", iface, bytes, packets)
 			log.Printf("Stats {received dropped queue-freeze}: %d", afpacketStats)
-		}
+		}*/
 	}
 	done <- true
 }
 
 type counterValue struct {
-	bytesUp		uint64
-	bytesDown 	uint64
+	bytesUp   uint64
+	bytesDown uint64
 }
 
-
 func saveTraffic(m *map[string]counterValue) {
-//	log.Print(*m)
-	log.Print("Flushing buffer")
-	*m =  make(map[string]counterValue)
+	//	log.Print(len(*m))
+	//	log.Print(*m)
+	log.Printf("Flushing buffer, %d values", len(*m))
+	*m = make(map[string]counterValue)
+}
+
+func handleConfig() {
+	viper.SetConfigName("trafmon") // name of config file (without extension)
+	viper.SetConfigType("yaml")    // REQUIRED if the config file does not have the extension in the name
+	viper.AddConfigPath(".")       // optionally look for config in the working directory
+
+	err := viper.ReadInConfig() // Find and read the config file
+	if err != nil {
+		log.Fatalf("Config parsing error: %v", err)
+	}
+
+	configOptions := [3]string{"bufferSize", "monitorInterval", "ifaces", "snapLen"}
+
+	for _, configOption := range configOptions {
+		if viper.IsSet(configOption) != true {
+			log.Fatalf("Config error: %v option not found", configOption)
+		}
+	}
+
+	bufferSize = viper.GetInt("bufferSize")
+	if bufferSize < 8 || bufferSize > 512 {
+		log.Fatal("Config error: Buffer size not valid!")
+	}
+
+	monitorInterval = viper.GetInt("monitorInterval")
+	if monitorInterval < 2 || monitorInterval > 3600 {
+		log.Fatal("Config error: monitoring interval not valid")
+	}
+
+	snapLen = viper.GetInt("snapLen")
+	if snapLen < 1 || snapLen > 65535 {
+		log.Fatal("Config error: snapLen not valid")
+	}
+
+	ifaces = viper.GetStringSlice("ifaces")
 }
 
 func main() {
-	flag.Parse()
+	handleConfig()
 
-	log.Printf("Starting on interface %q", *iface)
-
-	if *snaplen <= 0 {
-		*snaplen = 65535
-	}
-
-	szFrame, szBlock, numBlocks, err := afpacketComputeSize(*bufferSize, *snaplen, os.Getpagesize())
+	szFrame, szBlock, numBlocks, err := afpacketComputeSize(bufferSize, snapLen, os.Getpagesize())
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	pcapBPF, err := pcap.CompileBPFFilter(layers.LinkTypeEthernet, *snaplen, "ip")
+	pcapBPF, err := pcap.CompileBPFFilter(layers.LinkTypeEthernet, snapLen, "ip")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -200,29 +243,26 @@ func main() {
 	done := make(chan bool, 2)
 	traffic := make(chan flow, 100000)
 
-	go runSocket(szFrame, szBlock, numBlocks, "eth4", bpfIns, traffic, done)
-	go runSocket(szFrame, szBlock, numBlocks, "eth5", bpfIns, traffic, done)
+	for _, iface := range ifaces {
+		log.Printf("Starting capturing thread for %v", iface)
+		go runSocket(szFrame, szBlock, numBlocks, iface, bpfIns, traffic, done)
+	}
 
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(time.Duration(monitorInterval) * time.Second)
 
 	for {
 		select {
 		case <-ticker.C:
 			if activeCounter {
 				go saveTraffic(&counter1)
-//				log.Print(counter1)
-//				counter1 = make(map[string]counterValue)
 			} else {
 				go saveTraffic(&counter2)
-//				log.Print(counter2)
-//				counter2 = make(map[string]counterValue)
 			}
 
 			activeCounter = !activeCounter
 
 		case t := <-traffic:
 
-//			ipuint := binary.BigEndian.Uint32(t.addr)
 			ipstring := t.addr.String()
 
 			var m counterValue
@@ -236,7 +276,7 @@ func main() {
 			m.bytesUp += uint64(t.bytesUp)
 			m.bytesDown += uint64(t.bytesDown)
 
-                        if activeCounter {
+			if activeCounter {
 				counter1[ipstring] = m
 			} else {
 				counter2[ipstring] = m
@@ -244,6 +284,6 @@ func main() {
 		}
 	}
 
-	<- done
-	<- done
+	<-done
+	<-done
 }
