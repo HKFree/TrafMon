@@ -3,4 +3,11 @@ snapLen: 65535
 ifaces:
 - eth4
 - eth5
-monitorInterval: 5
+monitorInterval: 60
+
+influxUser: influxdbuser
+influxPass: influxdbpassword
+influxDB: influxdbdb
+influxHost: influxdbhost
+influxNameTag: oko
+

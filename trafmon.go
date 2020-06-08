@@ -9,15 +9,12 @@
 package main
 
 import (
-	//	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	//	"encoding/binary"
 	"time"
-	//	"runtime/pprof"
-	//	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/afpacket"
@@ -28,6 +25,8 @@ import (
 	"github.com/spf13/viper"
 
 	_ "github.com/google/gopacket/layers"
+
+	"github.com/influxdata/influxdb1-client/v2"
 )
 
 var (
@@ -36,6 +35,12 @@ var (
 	verbose         int = 1000000
 	monitorInterval int
 	ifaces          []string
+	influxHost      string
+	influxUser      string
+	influxPass      string
+	influxDB        string
+	influxNameTag   string
+	lastReportTime  time.Time
 )
 
 // afpacketComputeSize computes the block_size and the num_blocks in such a way that the
@@ -102,8 +107,8 @@ func runSocket(szFrame int, szBlock int, numBlocks int, iface string, bpf []bpf.
 	initialTimer := time.NewTimer(time.Second)
 	skip := true
 
-	bytes := uint64(0)
-	packets := uint64(0)
+	//	bytes := uint64(0)
+	//	packets := uint64(0)
 	for {
 		data, _, err := afpacket.ZeroCopyReadPacketData()
 		if err != nil {
@@ -171,9 +176,59 @@ type counterValue struct {
 }
 
 func saveTraffic(m *map[string]counterValue) {
-	//	log.Print(len(*m))
-	//	log.Print(*m)
-	log.Printf("Flushing buffer, %d values", len(*m))
+	timeSpent := time.Since(lastReportTime).Seconds()
+	lastReportTime = time.Now()
+
+	// Connect to InfluxDB
+	influx, err := client.NewHTTPClient(client.HTTPConfig{
+		Addr:     influxHost,
+		Username: influxUser,
+		Password: influxPass,
+	})
+
+	if err != nil {
+		log.Printf("Error creating InfluxDB Client: %v", err)
+		return
+	}
+
+	defer influx.Close()
+
+	// Create a new point batch
+	bp, _ := client.NewBatchPoints(client.BatchPointsConfig{
+		Database:  influxDB,
+		Precision: "s",
+	})
+
+	log.Printf("Writing buffer to InfluxDB, %d ips", len(*m))
+
+	for ipstring, counter := range *m {
+		// Create a point and add to batch
+		tags := map[string]string{
+			"ip":        ipstring,
+			"collector": influxNameTag,
+		}
+
+		fields := map[string]interface{}{
+			"up":   float64(counter.bytesUp) / timeSpent,
+			"down": float64(counter.bytesDown) / timeSpent,
+		}
+
+		pt, err := client.NewPoint("traffic", tags, fields, time.Now())
+		if err != nil {
+			log.Printf("Error creating point: %v", err.Error())
+		}
+
+		bp.AddPoint(pt)
+	}
+
+	err = influx.Write(bp)
+
+	if err != nil {
+		log.Fatalf("Error writing points: %v", err)
+	}
+
+	log.Printf("Written!")
+
 	*m = make(map[string]counterValue)
 }
 
@@ -187,7 +242,17 @@ func handleConfig() {
 		log.Fatalf("Config parsing error: %v", err)
 	}
 
-	configOptions := [3]string{"bufferSize", "monitorInterval", "ifaces", "snapLen"}
+	configOptions := [9]string{
+		"bufferSize",
+		"monitorInterval",
+		"ifaces",
+		"snapLen",
+		"influxUser",
+		"influxPass",
+		"influxHost",
+		"influxDB",
+		"influxNameTag",
+	}
 
 	for _, configOption := range configOptions {
 		if viper.IsSet(configOption) != true {
@@ -211,6 +276,12 @@ func handleConfig() {
 	}
 
 	ifaces = viper.GetStringSlice("ifaces")
+
+	influxUser = viper.GetString("influxUser")
+	influxPass = viper.GetString("influxPass")
+	influxHost = viper.GetString("influxHost")
+	influxDB = viper.GetString("influxDB")
+	influxNameTag = viper.GetString("influxNameTag")
 }
 
 func main() {
@@ -225,6 +296,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	bpfIns := []bpf.RawInstruction{}
 	for _, ins := range pcapBPF {
 		bpfIns2 := bpf.RawInstruction{
@@ -248,6 +320,7 @@ func main() {
 		go runSocket(szFrame, szBlock, numBlocks, iface, bpfIns, traffic, done)
 	}
 
+	lastReportTime = time.Now()
 	ticker := time.NewTicker(time.Duration(monitorInterval) * time.Second)
 
 	for {
