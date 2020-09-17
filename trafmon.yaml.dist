@@ -4,6 +4,7 @@ ifaces:
 - eth4
 - eth5
 monitorInterval: 60
+statsInterval: 60
 
 influxUser: influxdbuser
 influxPass: influxdbpassword

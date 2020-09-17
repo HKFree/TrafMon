@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	//	"encoding/binary"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/gopacket"
@@ -34,6 +35,7 @@ var (
 	snapLen         int
 	verbose         int = 1000000
 	monitorInterval int
+	statsInterval   int
 	ifaces          []string
 	influxHost      string
 	influxUser      string
@@ -41,6 +43,13 @@ var (
 	influxDB        string
 	influxNameTag   string
 	lastReportTime  time.Time
+)
+
+var (
+	cntPacketsTotal    uint64
+	cntPacketsParsed   uint64
+	cntPacketsUpload   uint64
+	cntPacketsDownload uint64
 )
 
 // afpacketComputeSize computes the block_size and the num_blocks in such a way that the
@@ -125,6 +134,8 @@ func runSocket(szFrame int, szBlock int, numBlocks int, iface string, bpf []bpf.
 			continue
 		}
 
+		atomic.AddUint64(&cntPacketsTotal, 1)
+
 		ethernet := layers.Ethernet{}
 		ip := layers.IPv4{}
 
@@ -142,18 +153,20 @@ func runSocket(szFrame int, szBlock int, numBlocks int, iface string, bpf []bpf.
 			continue
 		}
 
-		// Upload
+		atomic.AddUint64(&cntPacketsParsed, 1)
+
 		for _, myNet := range myNets {
+			// Upload
 			if myNet.Contains(ip.SrcIP) {
+				atomic.AddUint64(&cntPacketsUpload, 1)
 				traffic <- flow{ip.SrcIP, uint16(len(data)), 0}
 			}
-		}
-
-		// Donwload
-		for _, myNet := range myNets {
+			// Donwload
 			if myNet.Contains(ip.DstIP) {
+				atomic.AddUint64(&cntPacketsDownload, 1)
 				traffic <- flow{ip.DstIP, 0, uint16(len(data))}
 			}
+
 		}
 
 		//bytes += uint64(len(data))
@@ -270,6 +283,11 @@ func handleConfig() {
 		log.Fatal("Config error: monitoring interval not valid")
 	}
 
+	statsInterval = viper.GetInt("statsInterval")
+	if statsInterval < 2 || statsInterval > 3600 {
+		log.Fatal("Config error: statistics interval not valid")
+	}
+
 	snapLen = viper.GetInt("snapLen")
 	if snapLen < 1 || snapLen > 65535 {
 		log.Fatal("Config error: snapLen not valid")
@@ -284,8 +302,34 @@ func handleConfig() {
 	influxNameTag = viper.GetString("influxNameTag")
 }
 
+func clearStats() {
+	atomic.StoreUint64(&cntPacketsTotal, 0)
+	atomic.StoreUint64(&cntPacketsParsed, 0)
+	atomic.StoreUint64(&cntPacketsUpload, 0)
+	atomic.StoreUint64(&cntPacketsDownload, 0)
+}
+
+func printStats() {
+	tmpPacketsTotal := atomic.LoadUint64(&cntPacketsTotal)
+	tmpPacketsParsed := atomic.LoadUint64(&cntPacketsParsed)
+	tmpPacketsUpload := atomic.LoadUint64(&cntPacketsUpload)
+	tmpPacketsDownload := atomic.LoadUint64(&cntPacketsDownload)
+
+	log.Printf(
+		"Stats - total %v, parsed %v (%.1f %%), upload %v (%.1f %%), download %v (%.1f %%)",
+		tmpPacketsTotal,
+		tmpPacketsParsed,
+		100.0*float32(tmpPacketsParsed)/float32(tmpPacketsTotal),
+		tmpPacketsUpload,
+		100.0*float32(tmpPacketsUpload)/float32(tmpPacketsParsed),
+		tmpPacketsDownload,
+		100.0*float32(tmpPacketsDownload)/float32(tmpPacketsParsed),
+	)
+}
+
 func main() {
 	handleConfig()
+	clearStats()
 
 	szFrame, szBlock, numBlocks, err := afpacketComputeSize(bufferSize, snapLen, os.Getpagesize())
 	if err != nil {
@@ -322,6 +366,7 @@ func main() {
 
 	lastReportTime = time.Now()
 	ticker := time.NewTicker(time.Duration(monitorInterval) * time.Second)
+	statsTicker := time.NewTicker(time.Duration(statsInterval) * time.Second)
 
 	for {
 		select {
@@ -333,6 +378,10 @@ func main() {
 			}
 
 			activeCounter = !activeCounter
+
+		case <-statsTicker.C:
+			printStats()
+			clearStats()
 
 		case t := <-traffic:
 
