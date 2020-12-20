@@ -214,33 +214,40 @@ func saveTraffic(m *map[string]counterValue) {
 
 	log.Printf("Writing buffer to InfluxDB, %d ips", len(*m))
 
-	for ipstring, counter := range *m {
-		// Create a point and add to batch
-		tags := map[string]string{
-			"ip":        ipstring,
-			"collector": influxNameTag,
+	if len(*m) < 10000 {
+		timeInfluxStart := time.Now()
+		for ipstring, counter := range *m {
+			// Create a point and add to batch
+			tags := map[string]string{
+				"ip":        ipstring,
+				"collector": influxNameTag,
+			}
+
+			fields := map[string]interface{}{
+				"up":   float64(counter.bytesUp) / timeSpent,
+				"down": float64(counter.bytesDown) / timeSpent,
+			}
+
+			pt, err := client.NewPoint("traffic", tags, fields, time.Now())
+			if err != nil {
+				log.Printf("Error creating point: %v", err.Error())
+			}
+
+			bp.AddPoint(pt)
 		}
 
-		fields := map[string]interface{}{
-			"up":   float64(counter.bytesUp) / timeSpent,
-			"down": float64(counter.bytesDown) / timeSpent,
-		}
+		err = influx.Write(bp)
 
-		pt, err := client.NewPoint("traffic", tags, fields, time.Now())
+		timeInfluxTaken := time.Since(timeInfluxStart).Seconds()
+
 		if err != nil {
-			log.Printf("Error creating point: %v", err.Error())
+			log.Fatalf("Error writing points: %v", err)
 		}
 
-		bp.AddPoint(pt)
+		log.Printf("Written! (took %.2f sec)", timeInfluxTaken)
+	} else {
+		log.Printf("Got too many points, skipping!")
 	}
-
-	err = influx.Write(bp)
-
-	if err != nil {
-		log.Fatalf("Error writing points: %v", err)
-	}
-
-	log.Printf("Written!")
 
 	*m = make(map[string]counterValue)
 }
