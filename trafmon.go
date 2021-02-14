@@ -77,7 +77,7 @@ func afpacketComputeSize(targetSizeMb int, snaplen int, pageSize int) (
 }
 
 type flow struct {
-	addr      net.IP
+	addr      string
 	bytesUp   uint16
 	bytesDown uint16
 }
@@ -159,12 +159,12 @@ func runSocket(szFrame int, szBlock int, numBlocks int, iface string, bpf []bpf.
 			// Upload
 			if myNet.Contains(ip.SrcIP) {
 				atomic.AddUint64(&cntPacketsUpload, 1)
-				traffic <- flow{ip.SrcIP, uint16(len(data)), 0}
+				traffic <- flow{ip.SrcIP.String(), uint16(len(data)), 0}
 			}
 			// Donwload
 			if myNet.Contains(ip.DstIP) {
 				atomic.AddUint64(&cntPacketsDownload, 1)
-				traffic <- flow{ip.DstIP, 0, uint16(len(data))}
+				traffic <- flow{ip.DstIP.String(), 0, uint16(len(data))}
 			}
 
 		}
@@ -214,7 +214,7 @@ func saveTraffic(m *map[string]counterValue) {
 
 	log.Printf("Writing buffer to InfluxDB, %d ips", len(*m))
 
-	if len(*m) < 10000 {
+	if len(*m) < 100000 {
 		timeInfluxStart := time.Now()
 		for ipstring, counter := range *m {
 			// Create a point and add to batch
@@ -392,7 +392,7 @@ func main() {
 
 		case t := <-traffic:
 
-			ipstring := t.addr.String()
+			ipstring := t.addr
 
 			var m counterValue
 
